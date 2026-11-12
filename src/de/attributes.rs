@@ -77,6 +77,11 @@ impl<'i> Attributes<'i> {
             prefix,
             key_buf: String::new(),
             version,
+            entity_expansion: crate::escape::EntityExpansion {
+                max_depth: Some(crate::escape::DEFAULT_ENTITY_DEPTH),
+                max_bytes: Some(crate::escape::DEFAULT_ENTITY_BYTES),
+                max_references: Some(crate::escape::DEFAULT_ENTITY_REFERENCES),
+            },
         }
     }
 }
@@ -104,6 +109,8 @@ pub struct AttributesDeserializer<'i> {
     /// Kept in the deserializer to avoid many small allocations
     key_buf: String,
     version: XmlVersion,
+    /// Limits applied when an attribute value requires recursive entity expansion
+    entity_expansion: crate::escape::EntityExpansion,
 }
 
 impl<'de> Deserializer<'de> for AttributesDeserializer<'de> {
@@ -152,7 +159,12 @@ impl<'de> MapAccess<'de> for AttributesDeserializer<'de> {
     {
         match self.value.take() {
             Some(value) => {
-                let de = SimpleTypeDeserializer::from_attr(&value, 0..value.len(), self.version);
+                let de = SimpleTypeDeserializer::from_attr(
+                    &value,
+                    0..value.len(),
+                    self.version,
+                    self.entity_expansion,
+                );
                 seed.deserialize(de)
             }
             None => Err(DeError::KeyNotRead),

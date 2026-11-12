@@ -33,6 +33,16 @@
 
 - [#1010]: Implement `fmt::Display` on `QName`, `LocalName`, `Prefix` and `Namespace`.
 - [#1015]: Implement `From<LocalName>` on `QName`.
+- Add a composable `quick_xml::escape::EntityExpansion` strategy that bounds recursive
+  expansion of custom entities with a shared nesting depth, total output byte and
+  reference count budget and detects entity cycles. New `unescape_with_limits`,
+  `normalize_attribute_value_limited`, `Attribute::normalized_value_with_limits` and
+  `Deserializer::entity_expansion` APIs apply the strategy to text, attribute and
+  deserialization paths. Exceeding a limit returns a dedicated `EscapeError` variant
+  (`EntityDepthLimitExceeded`, `EntityByteLimitExceeded`, `EntityReferenceLimitExceeded`,
+  `EntityCycleDetected`). The non-recursive `unescape_with` semantics, predefined and
+  unknown entity handling are unchanged; the legacy `TooManyNestedEntities` variant is
+  deprecated.
 
 ### Bug Fixes
 

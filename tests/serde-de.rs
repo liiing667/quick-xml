@@ -1898,6 +1898,119 @@ mod resolve {
     }
 }
 
+/// Entity expansion limits must protect deserialization of untrusted XML from
+/// recursive and amplification attacks through custom entities.
+mod entity_expansion_limits {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use quick_xml::de::EntityResolver;
+    use quick_xml::escape::EntityExpansion;
+    use quick_xml::events::BytesText;
+    use std::collections::BTreeMap;
+    use std::convert::Infallible;
+
+    struct MapResolver(BTreeMap<String, String>);
+
+    impl EntityResolver for MapResolver {
+        type Error = Infallible;
+
+        fn capture(&mut self, _doctype: BytesText) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn resolve(&self, entity: &str) -> Option<&str> {
+            self.0.get(entity).map(String::as_str)
+        }
+    }
+
+    fn resolver(pairs: &[(&str, &str)]) -> MapResolver {
+        MapResolver(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn recursively_expands_custom_entities_in_text() {
+        let mut de = Deserializer::from_str_with_resolver(
+            "<root>&b;</root>",
+            resolver(&[("a", "x"), ("b", "&a;&a;")]),
+        );
+        let value: String = String::deserialize(&mut de).unwrap();
+        assert_eq!(value, "xx");
+    }
+
+    #[test]
+    fn cycle_is_reported_with_a_clear_error() {
+        let mut de = Deserializer::from_str_with_resolver(
+            "<root>&loop;</root>",
+            resolver(&[("loop", "&loop;")]),
+        );
+        let err = String::deserialize(&mut de).unwrap_err();
+        match err {
+            DeError::InvalidXml(quick_xml::Error::Escape(
+                quick_xml::escape::EscapeError::EntityCycleDetected(name),
+            )) => assert_eq!(name, "loop"),
+            other => panic!("expected a cycle error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn depth_limit_is_enforced() {
+        let mut de = Deserializer::from_str_with_resolver(
+            "<root>&e1;</root>",
+            resolver(&[("e1", "&e2;"), ("e2", "&e3;"), ("e3", "deep")]),
+        );
+        de.entity_expansion(EntityExpansion::default().with_max_depth(1));
+        let err = String::deserialize(&mut de).unwrap_err();
+        match err {
+            DeError::InvalidXml(quick_xml::Error::Escape(
+                quick_xml::escape::EscapeError::EntityDepthLimitExceeded(2),
+            )) => {}
+            other => panic!("expected a depth limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn byte_limit_stops_amplification() {
+        let mut de = Deserializer::from_str_with_resolver(
+            "<root>&lol2;</root>",
+            resolver(&[("lol", "abcdefgh"), ("lol2", "&lol;&lol;")]),
+        );
+        de.entity_expansion(EntityExpansion::default().with_max_bytes(10));
+        let err = String::deserialize(&mut de).unwrap_err();
+        match err {
+            DeError::InvalidXml(quick_xml::Error::Escape(
+                quick_xml::escape::EscapeError::EntityByteLimitExceeded(10),
+            )) => {}
+            other => panic!("expected a byte limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_limit_is_enforced() {
+        let mut de =
+            Deserializer::from_str_with_resolver("<root>&x;&x;&x;</root>", resolver(&[("x", "a")]));
+        de.entity_expansion(EntityExpansion::default().with_max_references(Some(2)));
+        let err = String::deserialize(&mut de).unwrap_err();
+        match err {
+            DeError::InvalidXml(quick_xml::Error::Escape(
+                quick_xml::escape::EscapeError::EntityReferenceLimitExceeded(2),
+            )) => {}
+            other => panic!("expected a reference limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn predefined_entities_remain_compatible() {
+        let mut de = Deserializer::from_str("<root>&lt;&amp;&gt;</root>");
+        let value: String = String::deserialize(&mut de).unwrap();
+        assert_eq!(value, "<&>");
+    }
+}
+
 /// A DOCTYPE declaration inside an element's text content used to split
 /// the surrounding character data into two consecutive `DeEvent::Text`
 /// events, tripping an `unreachable!()` in `read_text` ("Cannot be two

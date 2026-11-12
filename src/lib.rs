@@ -121,6 +121,24 @@ impl XmlVersion {
             _ => escape::normalize_xml10_attribute_value(value, depth, resolve_entity),
         }
     }
+
+    pub(crate) fn normalize_attribute_value_limited<'input, 'entity, F>(
+        &self,
+        value: &'input str,
+        expansion: escape::EntityExpansion,
+        resolve_entity: F,
+    ) -> std::result::Result<Cow<'input, str>, escape::EscapeError>
+    where
+        // the lifetime of the output comes from a capture or is `'static`
+        F: FnMut(&str) -> Option<&'entity str>,
+    {
+        match self {
+            Self::Explicit1_1 => {
+                escape::normalize_xml11_attribute_value_limited(value, expansion, resolve_entity)
+            }
+            _ => escape::normalize_xml10_attribute_value_limited(value, expansion, resolve_entity),
+        }
+    }
 }
 
 impl Default for XmlVersion {

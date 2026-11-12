@@ -340,6 +340,7 @@ where
                 &self.start.buf,
                 value,
                 self.de.reader.reader.xml_version(),
+                self.de.entity_expansion,
             )),
             // This arm processes the following XML shape:
             // <any-tag>

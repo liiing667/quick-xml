@@ -2112,7 +2112,7 @@ pub use crate::errors::serialize::DeError;
 use crate::{
     de::map::ElementMapAccess,
     errors::Error,
-    escape::{EscapeError, parse_number},
+    escape::{EntityExpansion, EscapeError, ExpansionGuard, expand_entity_into, parse_number},
     events::{BytesCData, BytesEnd, BytesRef, BytesStart, BytesText, Event},
     name::{NamespaceResolver, QName},
     reader::{NsReader, Reader},
@@ -2342,10 +2342,16 @@ struct XmlReader<'i, R: XmlRead<'i>, E: EntityResolver = PredefinedEntityResolve
     ///
     /// [`EscapeError::UnrecognizedEntity`]: crate::escape::EscapeError::UnrecognizedEntity
     entity_resolver: E,
+    /// Limits applied to recursive expansion of custom entities. The limits are
+    /// shared across all expansion paths (text, references and attributes).
+    entity_expansion: EntityExpansion,
+    /// Shared expansion budget of the currently drained text fragment. It is
+    /// reset whenever a new top-level text event is produced.
+    expansion_guard: Option<ExpansionGuard>,
 }
 
 impl<'i, R: XmlRead<'i>, E: EntityResolver> XmlReader<'i, R, E> {
-    fn new(mut reader: R, entity_resolver: E) -> Self {
+    fn new(mut reader: R, entity_resolver: E, entity_expansion: EntityExpansion) -> Self {
         // Lookahead by one event immediately, so we do not need to check in the
         // loop if we need lookahead or not
         let lookahead = reader.next();
@@ -2354,6 +2360,8 @@ impl<'i, R: XmlRead<'i>, E: EntityResolver> XmlReader<'i, R, E> {
             reader,
             lookahead,
             entity_resolver,
+            entity_expansion,
+            expansion_guard: None,
         }
     }
 
@@ -2399,18 +2407,27 @@ impl<'i, R: XmlRead<'i>, E: EntityResolver> XmlReader<'i, R, E> {
     /// [`Text`]: PayloadEvent::Text
     /// [`CData`]: PayloadEvent::CData
     fn drain_text(&mut self, mut result: Cow<'i, str>) -> Result<DeEvent<'i>, DeError> {
+        if self.expansion_guard.is_none() {
+            self.expansion_guard = Some(self.entity_expansion.guard());
+        }
         loop {
             if self.current_event_is_last_text() {
                 break;
             }
 
             match self.next_impl()? {
-                PayloadEvent::Text(e) => result
-                    .to_mut()
-                    .push_str(&e.xml_content(self.reader.xml_version())),
-                PayloadEvent::CData(e) => result
-                    .to_mut()
-                    .push_str(&e.xml_content(self.reader.xml_version())),
+                PayloadEvent::Text(e) => {
+                    let content = e.xml_content(self.reader.xml_version());
+                    let guard = self.expansion_guard.as_mut().expect("guard initialized");
+                    guard.reserve_bytes(content.len())?;
+                    result.to_mut().push_str(&content);
+                }
+                PayloadEvent::CData(e) => {
+                    let content = e.xml_content(self.reader.xml_version());
+                    let guard = self.expansion_guard.as_mut().expect("guard initialized");
+                    guard.reserve_bytes(content.len())?;
+                    result.to_mut().push_str(&content);
+                }
                 PayloadEvent::GeneralRef(e) => self.resolve_reference(result.to_mut(), e)?,
                 PayloadEvent::DocType(e) => {
                     self.entity_resolver
@@ -2424,6 +2441,7 @@ impl<'i, R: XmlRead<'i>, E: EntityResolver> XmlReader<'i, R, E> {
                 ),
             }
         }
+        self.expansion_guard = None;
         Ok(DeEvent::Text(Text::new(result)))
     }
 
@@ -2443,6 +2461,7 @@ impl<'i, R: XmlRead<'i>, E: EntityResolver> XmlReader<'i, R, E> {
                 }
                 PayloadEvent::GeneralRef(e) => {
                     let mut text = String::new();
+                    self.expansion_guard = Some(self.entity_expansion.guard());
                     self.resolve_reference(&mut text, e)?;
                     self.drain_text(text.into())
                 }
@@ -2457,10 +2476,30 @@ impl<'i, R: XmlRead<'i>, E: EntityResolver> XmlReader<'i, R, E> {
 
         if let Some(num) = reference.strip_prefix('#') {
             let codepoint = parse_number(num).map_err(EscapeError::InvalidCharRef)?;
-            result.push_str(codepoint.encode_utf8(&mut [0u8; 4]));
+            let mut buf = [0u8; 4];
+            let text = codepoint.encode_utf8(&mut buf);
+            let guard = self
+                .expansion_guard
+                .get_or_insert_with(|| self.entity_expansion.guard());
+            guard.reserve_bytes(text.len())?;
+            result.push_str(text);
             return Ok(());
         }
+        let guard = self
+            .expansion_guard
+            .get_or_insert_with(|| self.entity_expansion.guard());
+        // A custom resolver takes precedence and may override predefined entities.
+        // Only when it does not recognize the name do we fall back to the
+        // predefined resolver, whose fixed, entity-free replacements do not
+        // count against the custom entity budgets.
         if let Some(value) = self.entity_resolver.resolve(reference) {
+            guard.reserve_bytes(value.len())?;
+            let resolver = &self.entity_resolver;
+            let mut resolve = |entity: &str| resolver.resolve(entity);
+            return expand_entity_into(result, reference, guard, &mut resolve).map_err(Into::into);
+        }
+        if let Some(value) = crate::escape::resolve_predefined_entity(reference) {
+            guard.reserve_bytes(value.len())?;
             result.push_str(value);
             return Ok(());
         }
@@ -2574,6 +2613,9 @@ where
     depth: usize,
     /// Maximum allowed recursion depth. Defaults to 128.
     max_depth: usize,
+    /// Limits applied to recursive expansion of custom entities in text and
+    /// attribute values.
+    entity_expansion: EntityExpansion,
 }
 
 impl<'de, R, E> Deserializer<'de, R, E>
@@ -2588,8 +2630,9 @@ where
     ///  - [`Deserializer::from_str`]
     ///  - [`Deserializer::from_reader`]
     fn new(reader: R, ns_resolver: NamespaceResolver, entity_resolver: E) -> Self {
+        let entity_expansion = EntityExpansion::default();
         Self {
-            reader: XmlReader::new(reader, entity_resolver),
+            reader: XmlReader::new(reader, entity_resolver, entity_expansion),
             ns_resolver,
 
             #[cfg(feature = "overlapped-lists")]
@@ -2606,6 +2649,7 @@ where
 
             depth: 0,
             max_depth: 128,
+            entity_expansion,
         }
     }
 
@@ -2777,6 +2821,40 @@ where
     /// [DoS]: https://en.wikipedia.org/wiki/Denial-of-service_attack
     pub fn recursion_limit(&mut self, limit: usize) -> &mut Self {
         self.max_depth = limit;
+        self
+    }
+
+    /// Configures the [limits](EntityExpansion) for recursive expansion of
+    /// custom entities in text and attribute values.
+    ///
+    /// By default the conservative [`EntityExpansion::default`] limits are used,
+    /// which protect against "billion laughs" style expansion attacks when
+    /// deserializing untrusted XML. Pass [`EntityExpansion::UNLIMITED`] to
+    /// disable all limits.
+    ///
+    /// The same budget is shared by entity references expanded in text content,
+    /// attribute values and nested replacement texts of one deserialization.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use quick_xml::de::Deserializer;
+    /// use quick_xml::escape::EntityExpansion;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize)]
+    /// struct Root {
+    ///     #[serde(rename = "$text")]
+    ///     text: String,
+    /// }
+    ///
+    /// let mut de = Deserializer::from_str("<Root>&custom;</Root>");
+    /// de.entity_expansion(EntityExpansion::default().with_max_depth(4));
+    /// ```
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn entity_expansion(&mut self, expansion: EntityExpansion) -> &mut Self {
+        self.entity_expansion = expansion;
+        self.reader.entity_expansion = expansion;
         self
     }
 

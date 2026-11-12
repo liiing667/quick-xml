@@ -1,11 +1,21 @@
 //! Manage xml character escapes
 
+mod entity;
+
 use memchr::{memchr, memchr2_iter, memchr3};
 use std::borrow::Cow;
 use std::fmt::{self, Write};
 use std::num::ParseIntError;
 use std::ops::Range;
 use std::slice::Iter;
+
+#[cfg(not(feature = "serialize"))]
+pub(crate) use self::entity::ExpansionGuard;
+pub use self::entity::{
+    DEFAULT_ENTITY_BYTES, DEFAULT_ENTITY_DEPTH, DEFAULT_ENTITY_REFERENCES, EntityExpansion,
+};
+#[cfg(feature = "serialize")]
+pub(crate) use self::entity::{ExpansionGuard, expand_entity_into};
 
 /// Error of parsing character reference (`&#<dec-number>;` or `&#x<hex-number>;`).
 #[derive(Clone, Debug, PartialEq)]
@@ -60,7 +70,30 @@ pub enum EscapeError {
     /// Attribute normalization includes expanding of general entities (`&entity;`)
     /// which replacement text also could contain entities, which is also must be expanded.
     /// If more than 128 entities would be expanded, this error is returned.
+    #[deprecated(note = "kept for backward compatibility, new code returns one of the \
+                `EntityDepthLimitExceeded`, `EntityByteLimitExceeded`, \
+                `EntityReferenceLimitExceeded` or `EntityCycleDetected` errors")]
     TooManyNestedEntities,
+    /// Expansion of a custom entity reached the configured nesting depth limit
+    /// (see [`EntityExpansion::max_depth`]).
+    ///
+    /// The value is the number of nested entity expansions that was attempted.
+    EntityDepthLimitExceeded(usize),
+    /// Expanded content reached the configured total output byte limit
+    /// (see [`EntityExpansion::max_bytes`]).
+    ///
+    /// The value is the configured limit in bytes.
+    EntityByteLimitExceeded(usize),
+    /// Number of expanded entity references reached the configured limit
+    /// (see [`EntityExpansion::max_references`]).
+    ///
+    /// The value is the configured limit of entity references.
+    EntityReferenceLimitExceeded(usize),
+    /// A custom entity refers (directly or indirectly) to itself, so its
+    /// replacement text would be expanded forever.
+    ///
+    /// The value is the name of the entity that is already being expanded.
+    EntityCycleDetected(String),
 }
 
 impl std::fmt::Display for EscapeError {
@@ -75,8 +108,22 @@ impl std::fmt::Display for EscapeError {
                 e
             ),
             Self::InvalidCharRef(_) => f.write_str("invalid character reference"),
+            #[allow(deprecated)]
             Self::TooManyNestedEntities => {
                 f.write_str("too many nested entities in an attribute value")
+            }
+            Self::EntityDepthLimitExceeded(depth) => write!(
+                f,
+                "entity expansion depth limit exceeded at nesting level {depth}"
+            ),
+            Self::EntityByteLimitExceeded(limit) => {
+                write!(f, "entity expansion byte limit exceeded ({limit} bytes)")
+            }
+            Self::EntityReferenceLimitExceeded(limit) => {
+                write!(f, "entity reference limit exceeded ({limit} references)")
+            }
+            Self::EntityCycleDetected(entity) => {
+                write!(f, "recursive entity reference detected for `{entity}`")
             }
         }
     }
@@ -340,6 +387,54 @@ where
     }
 }
 
+/// Unescape an `&str` and replaces all xml escaped characters (`&...;`) into
+/// their corresponding value, recursively expanding custom entities under the
+/// shared [`EntityExpansion`] limits.
+///
+/// This is the bounded variant of [`unescape_with`]. In addition to the
+/// non-recursive behavior it:
+///
+/// - expands entity references found in replacement texts recursively;
+/// - enforces the nesting depth, total output byte and reference count
+///   limits from `expansion` on a single shared budget;
+/// - detects entity cycles and returns
+///   [`EscapeError::EntityCycleDetected`].
+///
+/// Predefined entities are resolved after `resolve_entity`, exactly as in
+/// [`unescape_with`], so a custom resolver can override them and unknown
+/// entities still return [`EscapeError::UnrecognizedEntity`]. Character
+/// references (`&#hh;`) are resolved first and cannot be overridden.
+///
+/// Pass [`EntityExpansion::UNLIMITED`] to disable all limits; use
+/// [`EntityExpansion::default`] for conservative limits suitable for untrusted
+/// input.
+///
+/// # Example
+///
+/// ```
+/// use quick_xml::escape::{EntityExpansion, unescape_with_limits};
+/// # use pretty_assertions::assert_eq;
+/// let resolve = |entity: &str| match entity {
+///     "a" => Some("&b;&b;"),
+///     "b" => Some("xy"),
+///     _ => None,
+/// };
+/// assert_eq!(
+///     unescape_with_limits("&a;", EntityExpansion::default(), resolve).unwrap(),
+///     "xyxy"
+/// );
+/// ```
+pub fn unescape_with_limits<'input, 'entity, F>(
+    raw: &'input str,
+    expansion: EntityExpansion,
+    resolve_entity: F,
+) -> Result<Cow<'input, str>, EscapeError>
+where
+    F: FnMut(&str) -> Option<&'entity str>,
+{
+    entity::unescape_with_limits(raw, expansion, resolve_entity)
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // TODO: It would be better to reuse buffer after decoding if possible
@@ -558,9 +653,31 @@ where
     // the lifetime of the output comes from a capture or is `'static`
     F: FnMut(&str) -> Option<&'entity str>,
 {
-    normalize_attribute_value(
+    normalize_attribute_value_limited(
         value,
-        depth,
+        EntityExpansion {
+            max_depth: Some(depth),
+            max_bytes: None,
+            max_references: None,
+        },
+        is_xml10_normalization_char,
+        normalize_xml10_eol_step,
+        resolve_entity,
+    )
+}
+
+pub(crate) fn normalize_xml10_attribute_value_limited<'input, 'entity, F>(
+    value: &'input str,
+    expansion: EntityExpansion,
+    resolve_entity: F,
+) -> Result<Cow<'input, str>, EscapeError>
+where
+    // the lifetime of the output comes from a capture or is `'static`
+    F: FnMut(&str) -> Option<&'entity str>,
+{
+    normalize_attribute_value_limited(
+        value,
+        expansion,
         is_xml10_normalization_char,
         normalize_xml10_eol_step,
         resolve_entity,
@@ -589,9 +706,31 @@ where
     // the lifetime of the output comes from a capture or is `'static`
     F: FnMut(&str) -> Option<&'entity str>,
 {
-    normalize_attribute_value(
+    normalize_attribute_value_limited(
         value,
-        depth,
+        EntityExpansion {
+            max_depth: Some(depth),
+            max_bytes: None,
+            max_references: None,
+        },
+        is_xml11_normalization_char,
+        normalize_xml11_eol_step,
+        resolve_entity,
+    )
+}
+
+pub(crate) fn normalize_xml11_attribute_value_limited<'input, 'entity, F>(
+    value: &'input str,
+    expansion: EntityExpansion,
+    resolve_entity: F,
+) -> Result<Cow<'input, str>, EscapeError>
+where
+    // the lifetime of the output comes from a capture or is `'static`
+    F: FnMut(&str) -> Option<&'entity str>,
+{
+    normalize_attribute_value_limited(
+        value,
+        expansion,
         is_xml11_normalization_char,
         normalize_xml11_eol_step,
         resolve_entity,
@@ -630,13 +769,18 @@ const fn is_xml11_normalization_char(b: &u8) -> bool {
 ///
 /// - `value`: unnormalized attribute value
 /// - `depth`: maximum number of nested entities that can be expanded. If expansion
-///   chain will be more that this value, the function will return [`EscapeError::TooManyNestedEntities`]
+///   chain will be more that this value, the function will return
+///   [`EscapeError::EntityDepthLimitExceeded`]
 /// - `is_normalization_char`: a function to check if byte is the start byte of character
 ///   that should be normalized (UTF-8 encoding is assumed)
 /// - `normalize_eol_step`: a function that performs EOL normalization of a character
 /// - `resolve_entity`: a function to resolve entity. This function could be called
 ///   multiple times on the same input and can return different values in each case
 ///   for the same input, although it is not recommended
+///
+/// Only the nesting depth is limited by this function; byte and reference
+/// budgets are not enforced. Use [`normalize_attribute_value_limited`] to apply
+/// the full [`EntityExpansion`] strategy.
 ///
 /// # Lifetimes
 ///
@@ -650,6 +794,51 @@ pub fn normalize_attribute_value<'input, 'entity, C, E, F>(
     depth: usize,
     is_normalization_char: C,
     normalize_eol_step: E,
+    resolve_entity: F,
+) -> Result<Cow<'input, str>, EscapeError>
+where
+    C: Fn(&u8) -> bool,
+    E: Fn(&mut String, &str, usize, char) -> usize,
+    // the lifetime of the output comes from a capture or is `'static`
+    F: FnMut(&str) -> Option<&'entity str>,
+{
+    let expansion = EntityExpansion {
+        max_depth: Some(depth),
+        max_bytes: None,
+        max_references: None,
+    };
+    normalize_attribute_value_limited(
+        value,
+        expansion,
+        is_normalization_char,
+        normalize_eol_step,
+        resolve_entity,
+    )
+}
+
+/// Returns the attribute value normalized as per [the XML specification],
+/// using a custom entity resolver and the given entity [expansion limits](EntityExpansion).
+///
+/// This is the bounded variant of [`normalize_attribute_value`]: in addition to
+/// the nesting depth it enforces the shared output-byte and reference-count
+/// budgets and detects recursive entity cycles. All limits are accounted on a
+/// single budget that is shared by the whole normalization, including entities
+/// expanded from replacement texts.
+///
+/// Do not use this method with HTML attributes.
+///
+/// # Lifetimes
+///
+/// - `'input`: lifetime of the unnormalized attribute. If normalization is not required,
+///   the input returned unchanged with the same lifetime
+/// - `'entity`: lifetime of all entities that is returned by the entity resolution routine
+///
+/// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
+pub fn normalize_attribute_value_limited<'input, 'entity, C, E, F>(
+    value: &'input str,
+    expansion: EntityExpansion,
+    is_normalization_char: C,
+    normalize_eol_step: E,
     mut resolve_entity: F,
 ) -> Result<Cow<'input, str>, EscapeError>
 where
@@ -659,6 +848,7 @@ where
     F: FnMut(&str) -> Option<&'entity str>,
 {
     let mut iter = value.as_bytes().iter();
+    let mut guard = expansion.guard();
 
     // If we found the character that requires normalization, create a normalized
     // version of the attribute, otherwise return the value unchanged
@@ -670,7 +860,7 @@ where
             value,
             0,
             i,
-            depth,
+            &mut guard,
             &is_normalization_char,
             &normalize_eol_step,
             &mut resolve_entity,
@@ -681,7 +871,7 @@ where
             &mut iter,
             value,
             pos,
-            depth,
+            &mut guard,
             &is_normalization_char,
             &normalize_eol_step,
             &mut resolve_entity,
@@ -696,7 +886,7 @@ fn normalize_attr_steps<'entity, C, E, F>(
     iter: &mut Iter<u8>,
     input: &str,
     mut pos: usize,
-    depth: usize,
+    guard: &mut ExpansionGuard,
     is_normalization_char: &C,
     normalize_eol_step: &E,
     resolve_entity: &mut F,
@@ -714,13 +904,14 @@ where
             input,
             pos,
             pos + i,
-            depth,
+            guard,
             is_normalization_char,
             normalize_eol_step,
             resolve_entity,
         )?;
     }
     if let Some(rest) = input.get(pos..) {
+        guard.reserve_bytes(rest.len())?;
         normalized.push_str(rest);
     }
     Ok(())
@@ -753,7 +944,7 @@ where
 /// - `index`: Index of the byte in `input` that should be processed now
 /// - `seen_cr`: `\r\n` and `\r\x85` sequences should be normalized into one space
 ///   so this parameter tracks if we seen the `\r` before processing the current byte
-/// - `depth`: Current recursion depth. Too deep recursion will interrupt the algorithm
+/// - `guard`: Shared expansion budget (depth, bytes, references and cycle tracking)
 /// - `is_normalization_char`: a function to check if byte is the start byte of character
 ///   that should be normalized (UTF-8 encoding is assumed)
 /// - `normalize_eol_step`: a function that performs EOL normalization of a character
@@ -771,7 +962,7 @@ fn normalize_attr_step<'entity, C, E, F>(
     input: &str,
     last_pos: usize,
     index: usize,
-    depth: usize,
+    guard: &mut ExpansionGuard,
     is_normalization_char: &C,
     normalize_eol_step: &E,
     resolve_entity: &mut F,
@@ -782,10 +973,8 @@ where
     // the lifetime of the output comes from a capture or is `'static`
     F: FnMut(&str) -> Option<&'entity str>,
 {
-    if depth == 0 {
-        return Err(EscapeError::TooManyNestedEntities);
-    }
     // 4. For another character, append the character to the normalized value.
+    guard.reserve_bytes(index - last_pos)?;
     normalized.push_str(&input[last_pos..index]);
 
     match input.as_bytes()[index] {
@@ -809,26 +998,33 @@ where
             //    to the normalized value.
             if let Some(entity) = pat.strip_prefix('#') {
                 let codepoint = parse_number(entity).map_err(EscapeError::InvalidCharRef)?;
-                normalized.push_str(codepoint.encode_utf8(&mut [0u8; 4]));
+                let mut buf = [0u8; 4];
+                let text = codepoint.encode_utf8(&mut buf);
+                guard.reserve_bytes(text.len())?;
+                normalized.push_str(text);
             } else
             // Special case: '&amp;' resolves to '&' and if follow this algorithm
             // without special handling, we got unterminated entity error
             if pat == "amp" {
+                guard.reserve_bytes(1)?;
                 normalized.push('&');
             } else
             // 2. For an entity reference, recursively apply this algorithm
             //    to the replacement text of the entity.
             if let Some(value) = resolve_entity(pat) {
-                normalize_attr_steps(
+                guard.enter_entity(pat)?;
+                let result = normalize_attr_steps(
                     normalized,
                     &mut value.as_bytes().iter(),
                     value,
                     0,
-                    depth.saturating_sub(1),
+                    guard,
                     is_normalization_char,
                     normalize_eol_step,
                     resolve_entity,
-                )?;
+                );
+                guard.leave_entity(pat);
+                result?;
             } else {
                 return Err(EscapeError::UnrecognizedEntity(start..end, pat.to_string()));
             }
@@ -838,11 +1034,14 @@ where
         //    a space character (#x20) to the normalized value.
         // Space character (#x20) has no special meaning, so it is handled on step 4
         b'\t' => {
+            guard.reserve_bytes(1)?;
             normalized.push(' ');
             Ok(index + 1) // +1 - skip \t
         }
         _ => {
             let pos = normalize_eol_step(normalized, input, index, ' ');
+            // Every EOL normalization step emits exactly one space character.
+            guard.reserve_bytes(1)?;
             // We should advance iterator because we may skip several characters
             for _ in 0..pos - index - 1 {
                 iter.next();
@@ -3173,14 +3372,14 @@ mod normalization {
                 normalize_xml10_attribute_value("&entity; reference", 5, |_| Some(
                     "recursive &entity;"
                 )),
-                Err(EscapeError::TooManyNestedEntities),
+                Err(EscapeError::EntityCycleDetected("entity".to_string())),
             );
 
             assert_eq!(
                 normalize_xml11_attribute_value("&entity; reference", 5, |_| Some(
                     "recursive &entity;"
                 )),
-                Err(EscapeError::TooManyNestedEntities),
+                Err(EscapeError::EntityCycleDetected("entity".to_string())),
             );
         }
 
@@ -3231,7 +3430,7 @@ mod normalization {
                         _ => None,
                     }
                 }),
-                Err(EscapeError::TooManyNestedEntities)
+                Err(EscapeError::EntityDepthLimitExceeded(6))
             );
         }
     }

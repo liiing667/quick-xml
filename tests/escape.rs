@@ -332,3 +332,299 @@ fn resolve_html5_entity() {
         "\u{3B1} \u{410} \u{1D538}"
     );
 }
+
+/// In-memory string fixtures for the composable custom entity expansion
+/// strategy. All inputs are small strings; limits must stop the expansion
+/// before it can grow into unbounded memory.
+mod entity_expansion {
+    use quick_xml::escape::{self, EscapeError};
+    use quick_xml::escape::{
+        DEFAULT_ENTITY_BYTES, DEFAULT_ENTITY_DEPTH, DEFAULT_ENTITY_REFERENCES, EntityExpansion,
+    };
+    use std::borrow::Cow;
+
+    /// Simple DTD-like entity table driven by an in-memory string fixture.
+    fn table<'a>(
+        entities: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str) -> Option<&'a str> + use<'a> {
+        move |name| {
+            entities
+                .iter()
+                .find(|(entity, _)| *entity == name)
+                .map(|(_, value)| *value)
+        }
+    }
+
+    #[test]
+    fn defaults_are_conservative() {
+        assert_eq!(DEFAULT_ENTITY_DEPTH, 128);
+        assert_eq!(DEFAULT_ENTITY_REFERENCES, 10_000);
+        assert_eq!(DEFAULT_ENTITY_BYTES, 10 * 1024 * 1024);
+        assert_eq!(
+            EntityExpansion::default(),
+            EntityExpansion {
+                max_depth: Some(DEFAULT_ENTITY_DEPTH),
+                max_bytes: Some(DEFAULT_ENTITY_BYTES),
+                max_references: Some(DEFAULT_ENTITY_REFERENCES),
+            }
+        );
+        assert_eq!(
+            EntityExpansion::UNLIMITED,
+            EntityExpansion {
+                max_depth: None,
+                max_bytes: None,
+                max_references: None,
+            }
+        );
+    }
+
+    #[test]
+    fn builders_compose() {
+        let expansion = EntityExpansion::default()
+            .with_max_depth(3)
+            .with_max_bytes(42)
+            .with_max_references(None);
+        assert_eq!(expansion.max_depth, Some(3));
+        assert_eq!(expansion.max_bytes, Some(42));
+        assert_eq!(expansion.max_references, None);
+    }
+
+    #[test]
+    fn recursively_expands_nested_entities() {
+        let entities = [("a", "&b;&b;"), ("b", "&c;&c;"), ("c", "x")];
+        let got = escape::unescape_with_limits("&a;", EntityExpansion::default(), table(&entities))
+            .unwrap();
+        // a -> 2 * b -> 4 * c -> "xxxx"
+        assert_eq!(got, "xxxx");
+    }
+
+    #[test]
+    fn depth_limit_stops_nesting() {
+        let entities = [
+            ("e1", "&e2;"),
+            ("e2", "&e3;"),
+            ("e3", "&e4;"),
+            ("e4", "deep"),
+        ];
+        let err = escape::unescape_with_limits(
+            "&e1;",
+            EntityExpansion::default().with_max_depth(2),
+            table(&entities),
+        )
+        .unwrap_err();
+        assert_eq!(err, EscapeError::EntityDepthLimitExceeded(3));
+
+        // The same chain succeeds when the depth covers all four levels
+        let got = escape::unescape_with_limits(
+            "&e1;",
+            EntityExpansion::default().with_max_depth(4),
+            table(&entities),
+        )
+        .unwrap();
+        assert_eq!(got, "deep");
+    }
+
+    #[test]
+    fn byte_limit_stops_amplification() {
+        // Each level doubles the output: a tiny input would grow without the
+        // byte budget.
+        let entities = [
+            ("lol", "abcdefgh"),
+            ("lol2", "&lol;&lol;"),
+            ("lol3", "&lol2;&lol2;"),
+            ("lol4", "&lol3;&lol3;"),
+        ];
+        let err = escape::unescape_with_limits(
+            "&lol4;",
+            EntityExpansion::default().with_max_bytes(20),
+            table(&entities),
+        )
+        .unwrap_err();
+        assert_eq!(err, EscapeError::EntityByteLimitExceeded(20));
+
+        // Literal text is counted against the same budget
+        let err = escape::unescape_with_limits(
+            "0123456789&lol;",
+            EntityExpansion::default().with_max_bytes(12),
+            table(&entities),
+        )
+        .unwrap_err();
+        assert_eq!(err, EscapeError::EntityByteLimitExceeded(12));
+    }
+
+    #[test]
+    fn reference_limit_stops_many_expansions() {
+        let entities = [("x", "a")];
+        let input = "&x;&x;&x;&x;&x;";
+        let err = escape::unescape_with_limits(
+            input,
+            EntityExpansion::default().with_max_references(Some(3)),
+            table(&entities),
+        )
+        .unwrap_err();
+        assert_eq!(err, EscapeError::EntityReferenceLimitExceeded(3));
+    }
+
+    #[test]
+    fn direct_and_indirect_cycles_are_detected() {
+        let direct = [("loop", "&loop;")];
+        assert_eq!(
+            escape::unescape_with_limits("&loop;", EntityExpansion::default(), table(&direct))
+                .unwrap_err(),
+            EscapeError::EntityCycleDetected("loop".to_string())
+        );
+
+        let indirect = [("a", "&b;"), ("b", "&a;")];
+        assert_eq!(
+            escape::unescape_with_limits("&a;", EntityExpansion::default(), table(&indirect))
+                .unwrap_err(),
+            EscapeError::EntityCycleDetected("a".to_string())
+        );
+
+        // Reusing an entity name in sibling references is not a cycle
+        let siblings = [("a", "x"), ("b", "&a;&a;")];
+        assert_eq!(
+            escape::unescape_with_limits("&b;", EntityExpansion::default(), table(&siblings))
+                .unwrap(),
+            "xx"
+        );
+    }
+
+    #[test]
+    fn unknown_entity_remains_an_error() {
+        let entities = [("known", "ok")];
+        assert_eq!(
+            escape::unescape_with_limits(
+                "text &missing; end",
+                EntityExpansion::default(),
+                table(&entities)
+            )
+            .unwrap_err(),
+            EscapeError::UnrecognizedEntity(6..13, "missing".to_string())
+        );
+    }
+
+    #[test]
+    fn predefined_entities_do_not_count_as_custom() {
+        let entities = [("custom", "&amp;")];
+        // The custom entity itself costs one level, but the nested `&amp;` is
+        // predefined and does not consume another level or reference.
+        let got = escape::unescape_with_limits(
+            "&lt;&custom;&gt;",
+            EntityExpansion::default()
+                .with_max_depth(1)
+                .with_max_references(Some(1)),
+            table(&entities),
+        )
+        .unwrap();
+        assert_eq!(got, "<&>");
+
+        // Purely predefined references need no custom budget at all
+        let got = escape::unescape_with_limits(
+            "&lt;&amp;&gt;",
+            EntityExpansion::default()
+                .with_max_depth(0)
+                .with_max_references(Some(0)),
+            table(&entities),
+        )
+        .unwrap();
+        assert_eq!(got, "<&>");
+    }
+
+    #[test]
+    fn custom_resolver_can_override_predefined_entity() {
+        let entities = [("amp", "OVERRIDE")];
+        let got =
+            escape::unescape_with_limits("&amp;", EntityExpansion::default(), table(&entities))
+                .unwrap();
+        assert_eq!(got, "OVERRIDE");
+    }
+
+    #[test]
+    fn non_recursive_unescape_with_is_unchanged() {
+        // The legacy API must not recursively expand and must not apply any
+        // limits, preserving its documented behavior.
+        let entities = [("a", "&b;"), ("b", "X")];
+        let got = escape::unescape_with("&a;", table(&entities)).unwrap();
+        assert_eq!(got, "&b;");
+
+        let got = escape::unescape_with("&a;&a;", table(&entities)).unwrap();
+        assert_eq!(got, "&b;&b;");
+    }
+
+    #[test]
+    fn unlimited_allows_deep_nesting() {
+        let entities = [
+            ("e1", "&e2;"),
+            ("e2", "&e3;"),
+            ("e3", "&e4;"),
+            ("e4", "bottom"),
+        ];
+        let got =
+            escape::unescape_with_limits("&e1;", EntityExpansion::UNLIMITED, table(&entities))
+                .unwrap();
+        assert_eq!(got, "bottom");
+    }
+
+    #[test]
+    fn attribute_normalization_shares_the_strategy() {
+        use quick_xml::XmlVersion;
+        use quick_xml::events::attributes::Attribute;
+
+        let entities = [("e1", "&e2;"), ("e2", "&e3;"), ("e3", "value")];
+
+        let attr = Attribute {
+            key: quick_xml::name::QName("a"),
+            value: Cow::Borrowed("&e1;"),
+        };
+        // Depth limit applies through the attribute path
+        let err = attr
+            .normalized_value_with_limits(
+                XmlVersion::Implicit1_0,
+                EntityExpansion::default().with_max_depth(1),
+                table(&entities),
+            )
+            .unwrap_err();
+        match err {
+            quick_xml::Error::Escape(EscapeError::EntityDepthLimitExceeded(2)) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // Whitespace normalization still happens alongside expansion
+        let attr = Attribute {
+            key: quick_xml::name::QName("a"),
+            value: Cow::Borrowed("\t&e1;\n"),
+        };
+        let got = attr
+            .normalized_value_with_limits(
+                XmlVersion::Implicit1_0,
+                EntityExpansion::default(),
+                table(&entities),
+            )
+            .unwrap();
+        assert_eq!(got, Cow::Borrowed(" value "));
+    }
+
+    #[test]
+    fn byte_limit_includes_attribute_literal_text() {
+        use quick_xml::XmlVersion;
+        use quick_xml::events::attributes::Attribute;
+
+        let entities = [("e", "abcdefgh")];
+        let attr = Attribute {
+            key: quick_xml::name::QName("a"),
+            value: Cow::Borrowed("0123456789&e;"),
+        };
+        let err = attr
+            .normalized_value_with_limits(
+                XmlVersion::Implicit1_0,
+                EntityExpansion::default().with_max_bytes(12),
+                table(&entities),
+            )
+            .unwrap_err();
+        match err {
+            quick_xml::Error::Escape(EscapeError::EntityByteLimitExceeded(12)) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}

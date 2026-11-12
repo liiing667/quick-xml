@@ -501,6 +501,8 @@ pub struct SimpleTypeDeserializer<'de, 'a> {
     /// If `true`, `content` in escaped form and should be unescaped before use
     is_attr: bool,
     version: XmlVersion,
+    /// Limits applied when an attribute value requires recursive entity expansion
+    entity_expansion: crate::escape::EntityExpansion,
 }
 
 impl<'de, 'a> SimpleTypeDeserializer<'de, 'a> {
@@ -512,7 +514,12 @@ impl<'de, 'a> SimpleTypeDeserializer<'de, 'a> {
             Cow::Borrowed(slice) => CowRef::Input(slice),
             Cow::Owned(content) => CowRef::Owned(content),
         };
-        Self::new(content, false, XmlVersion::Implicit1_0)
+        Self::new(
+            content,
+            false,
+            XmlVersion::Implicit1_0,
+            crate::escape::EntityExpansion::default(),
+        )
     }
     /// Creates a deserializer from an XML text node, that possible borrowed from input.
     ///
@@ -531,21 +538,28 @@ impl<'de, 'a> SimpleTypeDeserializer<'de, 'a> {
         value: &'a Cow<'de, str>,
         range: Range<usize>,
         version: XmlVersion,
+        entity_expansion: crate::escape::EntityExpansion,
     ) -> Self {
         let content = match value {
             Cow::Borrowed(slice) => CowRef::Input(&slice[range]),
             Cow::Owned(slice) => CowRef::Slice(&slice[range]),
         };
-        Self::new(content, true, version)
+        Self::new(content, true, version, entity_expansion)
     }
 
     /// Constructor for tests
     #[inline]
-    const fn new(content: CowRef<'de, 'a, str>, is_attr: bool, version: XmlVersion) -> Self {
+    const fn new(
+        content: CowRef<'de, 'a, str>,
+        is_attr: bool,
+        version: XmlVersion,
+        entity_expansion: crate::escape::EntityExpansion,
+    ) -> Self {
         Self {
             content,
             is_attr,
             version,
+            entity_expansion,
         }
     }
 
@@ -558,9 +572,11 @@ impl<'de, 'a> SimpleTypeDeserializer<'de, 'a> {
             CowRef::Owned(ref content) => CowRef::Slice(content.as_str()),
         };
         if self.is_attr {
-            let value =
-                self.version
-                    .normalize_attribute_value(&content, 128, resolve_predefined_entity)?;
+            let value = self.version.normalize_attribute_value_limited(
+                &content,
+                self.entity_expansion,
+                resolve_predefined_entity,
+            )?;
             return Ok(match value {
                 Cow::Borrowed(_) => content,
                 Cow::Owned(value) => CowRef::Owned(value),
@@ -757,6 +773,7 @@ mod tests {
                     CowRef::Input(xml.as_ref()),
                     true,
                     XmlVersion::Implicit1_0,
+                    crate::escape::EntityExpansion::default(),
                 );
                 let data: $type = Deserialize::deserialize(de).unwrap();
 
@@ -774,6 +791,7 @@ mod tests {
                     CowRef::Input(xml.as_ref()),
                     true,
                     XmlVersion::Implicit1_0,
+                    crate::escape::EntityExpansion::default(),
                 );
                 let data: $type = Deserialize::deserialize(de).unwrap();
 
@@ -802,6 +820,7 @@ mod tests {
                     CowRef::Input(xml.as_ref()),
                     true,
                     XmlVersion::Implicit1_0,
+                    crate::escape::EntityExpansion::default(),
                 );
                 let err = <$type as Deserialize>::deserialize(de).unwrap_err();
 

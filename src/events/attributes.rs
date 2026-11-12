@@ -110,7 +110,8 @@ impl<'a> Attribute<'a> {
     /// # Parameters
     ///
     /// - `depth`: maximum number of nested entities that can be expanded. If expansion
-    ///   chain will be more that this value, the function will return [`EscapeError::TooManyNestedEntities`]
+    ///   chain will be more that this value, the function will return
+    ///   [`EscapeError::EntityDepthLimitExceeded`]
     /// - `resolve_entity`: a function to resolve entity. This function could be called
     ///   multiple times on the same input and can return different values in each case
     ///   for the same input, although it is not recommended
@@ -118,7 +119,7 @@ impl<'a> Attribute<'a> {
     /// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
     /// [for 1.0]: https://www.w3.org/TR/xml/#AVNormalize
     /// [only for]: https://html.spec.whatwg.org/#normalize-newlines
-    /// [`EscapeError::TooManyNestedEntities`]: crate::escape::EscapeError::TooManyNestedEntities
+    /// [`EscapeError::EntityDepthLimitExceeded`]: crate::escape::EscapeError::EntityDepthLimitExceeded
     pub fn normalized_value_with<'entity>(
         &self,
         version: XmlVersion,
@@ -126,6 +127,34 @@ impl<'a> Attribute<'a> {
         resolve_entity: impl FnMut(&str) -> Option<&'entity str>,
     ) -> XmlResult<Cow<'a, str>> {
         match version.normalize_attribute_value(&self.value, depth, resolve_entity)? {
+            // Because result is borrowed, no replacements was done and we can use original string
+            Cow::Borrowed(_) => Ok(self.value.clone()),
+            Cow::Owned(s) => Ok(s.into()),
+        }
+    }
+
+    /// Returns the attribute value normalized as per [the XML specification] (or [for 1.0]),
+    /// using a custom entity resolver and the given entity [expansion limits](EntityExpansion).
+    ///
+    /// This is the bounded variant of [`normalized_value_with()`](Self::normalized_value_with).
+    /// The whole normalization, including entities expanded from replacement texts, shares one
+    /// budget that enforces the nesting depth, total output bytes and reference count limits and
+    /// detects recursive entity cycles.
+    ///
+    /// Do not use this method with HTML attributes.
+    ///
+    /// Use [`EntityExpansion::UNLIMITED`] to disable all limits or
+    /// [`EntityExpansion::default`] for conservative limits suitable for untrusted input.
+    ///
+    /// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
+    /// [for 1.0]: https://www.w3.org/TR/xml/#AVNormalize
+    pub fn normalized_value_with_limits<'entity>(
+        &self,
+        version: XmlVersion,
+        expansion: crate::escape::EntityExpansion,
+        resolve_entity: impl FnMut(&str) -> Option<&'entity str>,
+    ) -> XmlResult<Cow<'a, str>> {
+        match version.normalize_attribute_value_limited(&self.value, expansion, resolve_entity)? {
             // Because result is borrowed, no replacements was done and we can use original string
             Cow::Borrowed(_) => Ok(self.value.clone()),
             Cow::Owned(s) => Ok(s.into()),
@@ -224,7 +253,8 @@ impl<'a> Attribute<'a> {
     /// # Parameters
     ///
     /// - `depth`: maximum number of nested entities that can be expanded. If expansion
-    ///   chain will be more that this value, the function will return [`EscapeError::TooManyNestedEntities`]
+    ///   chain will be more that this value, the function will return
+    ///   [`EscapeError::EntityDepthLimitExceeded`]
     /// - `resolve_entity`: a function to resolve entity. This function could be called
     ///   multiple times on the same input and can return different values in each case
     ///   for the same input, although it is not recommended
@@ -232,7 +262,7 @@ impl<'a> Attribute<'a> {
     /// [the XML specification]: https://www.w3.org/TR/xml11/#AVNormalize
     /// [for 1.0]: https://www.w3.org/TR/xml/#AVNormalize
     /// [only for]: https://html.spec.whatwg.org/#normalize-newlines
-    /// [`EscapeError::TooManyNestedEntities`]: crate::escape::EscapeError::TooManyNestedEntities
+    /// [`EscapeError::EntityDepthLimitExceeded`]: crate::escape::EscapeError::EntityDepthLimitExceeded
     #[deprecated = "decoding is no longer needed, use `normalized_value_with()` instead"]
     #[inline]
     pub fn decoded_and_normalized_value_with<'entity>(
